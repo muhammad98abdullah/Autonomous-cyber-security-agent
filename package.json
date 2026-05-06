@@ -1,0 +1,20 @@
+{
+  "name": "fyp",
+  "version": "1.0.0",
+  "description": "",
+  "homepage": "https://github.com/muhammad98abdullah/Autonomous-cyber-security-agent#readme",
+  "bugs": {
+    "url": "https://github.com/muhammad98abdullah/Autonomous-cyber-security-agent/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/muhammad98abdullah/Autonomous-cyber-security-agent.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  }
+}
