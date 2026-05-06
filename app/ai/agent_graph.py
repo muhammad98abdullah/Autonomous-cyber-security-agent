@@ -4,8 +4,12 @@ from typing import TypedDict
 from openai import OpenAI
 from app.ai.tools import detect_attack, take_action
 
+groq_api_key = os.getenv("GROQ_KEY")
+if not groq_api_key:
+    raise EnvironmentError("GROQ_KEY environment variable is required")
+
 client = OpenAI(
-    api_key=os.getenv("GROQ_API_KEY"),
+    api_key=groq_api_key,
     base_url="https://api.groq.com/openai/v1"
 )
 # 🔹 Agent state
