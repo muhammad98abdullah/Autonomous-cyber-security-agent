@@ -1,245 +1,464 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import ipaddress
 import secrets
-from threading import Thread
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 
-from app.ai.explain import explain_attack
-from app.ml.predict import predict
-from app.ml.train import train_model
-from app.network.capture import is_sniffing, start_sniffing, stop_sniffing
-from app.response.actions import respond
+from app.ai.advisor import explain_security_event
+from app.db import get_db, init_db, json_dumps, json_loads, row_to_dict
+
 
 router = APIRouter()
-EVENTS = []
 MAX_EVENTS = 500
-TRAINING_STATUS = {"running": False, "lastRun": None, "message": "Idle"}
-SITES = {}
-SITE_EVENTS = {}
-AGENTS = {}
+BLOCK_DURATION_HOURS = 24
+AGENT_VERSION = "0.1.0"
 
-
-def _append_event(event: dict):
-    EVENTS.insert(0, event)
-    if len(EVENTS) > MAX_EVENTS:
-        del EVENTS[MAX_EVENTS:]
+init_db()
 
 
 def _iso_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _require_site(site_id: str):
-    site = SITES.get(site_id)
-    if not site:
+def _parse_dt(value):
+    if not value:
         return None
-    return site
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
-@router.post("/detect")
-def detect(data: dict):
-    features = data.get("features", [])
-    source_ip = data.get("sourceIp", "Manual Input")
+def _bearer_token(authorization: Optional[str]):
+    if not authorization:
+        return None
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        return None
+    return authorization[len(prefix) :].strip()
 
-    attack = predict(features)
-    explanation = explain_attack(attack)
-    action = respond(attack, source_ip)
 
-    event = {
-        "id": f"manual-{int(datetime.now(timezone.utc).timestamp() * 1000)}",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "attack": attack,
-        "explanation": explanation,
-        "action": action,
-        "sourceIp": source_ip,
+def _site_public(site):
+    return {
+        "id": site["id"],
+        "name": site["name"],
+        "domain": site["domain"],
+        "serverType": site["server_type"],
+        "osType": site["os_type"],
+        "mode": site["mode"],
+        "createdAt": site["created_at"],
+        "lastHeartbeatAt": site["last_heartbeat_at"],
     }
-    _append_event(event)
 
-    return {"attack": attack, "explanation": explanation, "action": action}
+
+def _require_agent(site_id: str, token: str):
+    with get_db() as db:
+        site = db.execute("SELECT * FROM sites WHERE id = ?", (site_id,)).fetchone()
+        if not site or token != site["agent_token"]:
+            raise HTTPException(status_code=401, detail="Unauthorized agent")
+        return row_to_dict(site)
+
+
+def _require_dashboard(site_id: str, authorization: Optional[str]):
+    token = _bearer_token(authorization)
+    with get_db() as db:
+        site = db.execute("SELECT * FROM sites WHERE id = ?", (site_id,)).fetchone()
+        if not site or token != site["dashboard_token"]:
+            raise HTTPException(status_code=401, detail="Unauthorized dashboard")
+        return row_to_dict(site)
+
+
+def _is_public_ip(value):
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return ip.is_global
+
+
+def _normalize_severity(value):
+    value = str(value or "medium").lower()
+    return value if value in {"low", "medium", "high", "critical"} else "medium"
+
+
+def _should_block(event):
+    severity = _normalize_severity(event.get("severity"))
+    source_ip = event.get("sourceIp") or event.get("source_ip") or ""
+    return severity in {"high", "critical"} and _is_public_ip(source_ip)
+
+
+def _build_install_command(request: Request, site_id: str, enrollment_token: str):
+    backend_url = str(request.base_url).rstrip("/")
+    return (
+        f"curl -fsSL {backend_url}/install.sh | sudo bash -s -- "
+        f"--backend-url {backend_url} "
+        f"--site-id {site_id} "
+        f"--enroll-token {enrollment_token}"
+    )
+
+
+@router.get("/install.sh", response_class=PlainTextResponse)
+def install_script():
+    return """#!/usr/bin/env bash
+set -euo pipefail
+
+BACKEND_URL=""
+SITE_ID=""
+ENROLL_TOKEN=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --backend-url) BACKEND_URL="$2"; shift 2 ;;
+    --site-id) SITE_ID="$2"; shift 2 ;;
+    --enroll-token) ENROLL_TOKEN="$2"; shift 2 ;;
+    *) echo "Unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "$BACKEND_URL" || -z "$SITE_ID" || -z "$ENROLL_TOKEN" ]]; then
+  echo "Usage: install.sh --backend-url URL --site-id ID --enroll-token TOKEN" >&2
+  exit 1
+fi
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "Please run with sudo." >&2
+  exit 1
+fi
+
+apt-get update
+apt-get install -y python3 python3-venv python3-pip curl ufw
+
+install -d /opt/astra-agent /etc/astra-agent /var/lib/astra-agent
+curl -fsSL "$BACKEND_URL/agent/astra_agent.py" -o /opt/astra-agent/astra_agent.py
+python3 -m venv /opt/astra-agent/.venv
+/opt/astra-agent/.venv/bin/pip install --upgrade pip requests
+
+cat > /etc/astra-agent/config.json <<EOF
+{
+  "backend_url": "$BACKEND_URL",
+  "site_id": "$SITE_ID",
+  "enroll_token": "$ENROLL_TOKEN",
+  "agent_token": "",
+  "interval": 10,
+  "state_dir": "/var/lib/astra-agent"
+}
+EOF
+
+cat > /etc/systemd/system/astra-agent.service <<'EOF'
+[Unit]
+Description=ASTRA website security agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/astra-agent/.venv/bin/python /opt/astra-agent/astra_agent.py --config /etc/astra-agent/config.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now astra-agent.service
+echo "ASTRA agent installed and started."
+"""
+
+
+@router.get("/agent/astra_agent.py", response_class=PlainTextResponse)
+def agent_source():
+    with open("astra_agent.py", "r", encoding="utf-8") as agent_file:
+        return agent_file.read()
+
+
+@router.post("/v1/sites")
+def create_v1_site(data: dict, request: Request):
+    site_id = f"site_{uuid4().hex[:12]}"
+    enrollment_token = secrets.token_urlsafe(32)
+    dashboard_token = secrets.token_urlsafe(32)
+    now = _iso_now()
+    with get_db() as db:
+        db.execute(
+            """
+            INSERT INTO sites (
+                id, name, domain, server_type, os_type, mode, enrollment_token,
+                dashboard_token, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                site_id,
+                data.get("name") or "Untitled Site",
+                data.get("domain") or "",
+                data.get("serverType") or "auto",
+                data.get("osType") or "linux",
+                data.get("mode") or "autoprotect",
+                enrollment_token,
+                dashboard_token,
+                now,
+            ),
+        )
+        site = db.execute("SELECT * FROM sites WHERE id = ?", (site_id,)).fetchone()
+    return {
+        "site": _site_public(site),
+        "enrollmentToken": enrollment_token,
+        "dashboardToken": dashboard_token,
+        "installCommand": _build_install_command(request, site_id, enrollment_token),
+    }
+
+
+@router.post("/v1/agents/enroll")
+def enroll_agent(data: dict):
+    site_id = data.get("siteId")
+    enrollment_token = data.get("enrollToken") or data.get("enrollmentToken")
+    hostname = data.get("hostname") or "unknown-host"
+    version = data.get("version") or AGENT_VERSION
+    now = _iso_now()
+    with get_db() as db:
+        site = db.execute("SELECT * FROM sites WHERE id = ?", (site_id,)).fetchone()
+        if not site or enrollment_token != site["enrollment_token"]:
+            raise HTTPException(status_code=401, detail="Unauthorized enrollment")
+        agent_token = site["agent_token"] or secrets.token_urlsafe(32)
+        db.execute(
+            "UPDATE sites SET agent_token = ?, last_heartbeat_at = ? WHERE id = ?",
+            (agent_token, now, site_id),
+        )
+        db.execute(
+            """
+            INSERT INTO agents (site_id, hostname, version, enrolled_at, last_heartbeat_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(site_id) DO UPDATE SET
+                hostname = excluded.hostname,
+                version = excluded.version,
+                last_heartbeat_at = excluded.last_heartbeat_at
+            """,
+            (site_id, hostname, version, now, now),
+        )
+    return {"status": "enrolled", "siteId": site_id, "agentToken": agent_token}
+
+
+@router.post("/v1/agents/heartbeat")
+def agent_heartbeat(data: dict):
+    site_id = data.get("siteId")
+    token = data.get("agentToken")
+    _require_agent(site_id, token)
+    now = _iso_now()
+    with get_db() as db:
+        db.execute("UPDATE sites SET last_heartbeat_at = ? WHERE id = ?", (now, site_id))
+        db.execute("UPDATE agents SET last_heartbeat_at = ? WHERE site_id = ?", (now, site_id))
+        site = db.execute("SELECT * FROM sites WHERE id = ?", (site_id,)).fetchone()
+    return {"status": "ok", "mode": site["mode"], "blockDurationHours": BLOCK_DURATION_HOURS}
+
+
+@router.post("/v1/agents/events")
+def agent_events(data: dict):
+    site_id = data.get("siteId")
+    token = data.get("agentToken")
+    site = _require_agent(site_id, token)
+    events = data.get("events") or []
+    responses = []
+    now = _iso_now()
+    with get_db() as db:
+        for event in events:
+            event_id = event.get("id") or f"evt_{uuid4().hex[:12]}"
+            attack_type = event.get("attackType") or event.get("attack_type") or "unknown"
+            severity = _normalize_severity(event.get("severity"))
+            source_ip = event.get("sourceIp") or event.get("source_ip") or "Unknown"
+            enriched_event = {
+                **event,
+                "attackType": attack_type,
+                "severity": severity,
+                "sourceIp": source_ip,
+                "siteName": site["name"],
+            }
+            advice = explain_security_event(enriched_event)
+            should_block = site["mode"] == "autoprotect" and _should_block(enriched_event)
+            action_taken = "Block requested" if should_block else "Monitored"
+            db.execute(
+                """
+                INSERT OR REPLACE INTO events (
+                    id, site_id, timestamp, attack_type, severity, source_ip, method, path,
+                    status_code, user_agent, rule_id, event_count, sample_lines, explanation,
+                    solutions, action_taken, should_block, block_duration_hours, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    site_id,
+                    event.get("timestamp") or now,
+                    attack_type,
+                    severity,
+                    source_ip,
+                    event.get("method"),
+                    event.get("path"),
+                    event.get("statusCode"),
+                    event.get("userAgent"),
+                    event.get("ruleId"),
+                    int(event.get("eventCount") or 1),
+                    json_dumps(event.get("sampleLines")),
+                    advice["explanation"],
+                    json_dumps(advice["solutions"]),
+                    action_taken,
+                    1 if should_block else 0,
+                    BLOCK_DURATION_HOURS,
+                    now,
+                ),
+            )
+            responses.append(
+                {
+                    "eventId": event_id,
+                    "block": should_block,
+                    "blockDurationHours": BLOCK_DURATION_HOURS,
+                    "explanation": advice["explanation"],
+                    "solutions": advice["solutions"],
+                    "action": action_taken,
+                }
+            )
+        db.execute(
+            """
+            DELETE FROM events
+            WHERE site_id = ? AND id NOT IN (
+                SELECT id FROM events WHERE site_id = ? ORDER BY created_at DESC LIMIT ?
+            )
+            """,
+            (site_id, site_id, MAX_EVENTS),
+        )
+    return {"status": "ok", "received": len(events), "responses": responses}
+
+
+@router.post("/v1/agents/block-result")
+def block_result(data: dict):
+    site_id = data.get("siteId")
+    token = data.get("agentToken")
+    _require_agent(site_id, token)
+    now = _iso_now()
+    with get_db() as db:
+        db.execute(
+            """
+            INSERT INTO blocks (
+                id, site_id, event_id, source_ip, action, status, message, expires_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data.get("id") or f"blk_{uuid4().hex[:12]}",
+                site_id,
+                data.get("eventId"),
+                data.get("sourceIp") or "Unknown",
+                data.get("action") or "block",
+                data.get("status") or "unknown",
+                data.get("message") or "",
+                data.get("expiresAt"),
+                now,
+            ),
+        )
+    return {"status": "ok"}
+
+
+@router.get("/v1/sites/{site_id}/health")
+def site_health(site_id: str, authorization: Optional[str] = Header(default=None)):
+    site = _require_dashboard(site_id, authorization)
+    now = datetime.now(timezone.utc)
+    heartbeat_at = _parse_dt(site.get("last_heartbeat_at"))
+    agent_online = bool(heartbeat_at and now - heartbeat_at < timedelta(minutes=2))
+    with get_db() as db:
+        rows = db.execute(
+            """
+            SELECT * FROM events
+            WHERE site_id = ? AND severity IN ('medium', 'high', 'critical')
+            ORDER BY created_at DESC
+            LIMIT 50
+            """,
+            (site_id,),
+        ).fetchall()
+        active_blocks = db.execute(
+            """
+            SELECT COUNT(*) AS count FROM blocks
+            WHERE site_id = ? AND action = 'block' AND status = 'success'
+            AND (expires_at IS NULL OR expires_at > ?)
+            """,
+            (site_id, _iso_now()),
+        ).fetchone()["count"]
+
+    active_events = [row_to_dict(row) for row in rows]
+    high_events = [e for e in active_events if e["severity"] in {"high", "critical"}]
+    last = high_events[0] if high_events else (active_events[0] if active_events else None)
+    status = "danger" if high_events else "ok"
+    danger_level = "none" if not last else last["severity"]
+    response = {
+        "status": status,
+        "siteId": site_id,
+        "siteName": site["name"],
+        "agentOnline": agent_online,
+        "lastHeartbeatAt": site.get("last_heartbeat_at"),
+        "dangerLevel": danger_level,
+        "activeDangerCount": len(high_events),
+        "activeBlocks": active_blocks,
+        "lastDanger": None,
+        "message": "Everything is OK" if status == "ok" else "Attack detected and blocked",
+    }
+    if last:
+        response["lastDanger"] = {
+            "attackType": last["attack_type"],
+            "sourceIp": last["source_ip"],
+            "explanation": last["explanation"],
+            "solutions": json_loads(last["solutions"]),
+            "actionTaken": last["action_taken"],
+        }
+    return response
+
+
+@router.get("/v1/sites/{site_id}/events")
+def site_events(site_id: str, authorization: Optional[str] = Header(default=None), limit: int = 100):
+    _require_dashboard(site_id, authorization)
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT * FROM events WHERE site_id = ? ORDER BY created_at DESC LIMIT ?",
+            (site_id, max(1, min(limit, 500))),
+        ).fetchall()
+    return {"items": [row_to_dict(row) for row in rows], "total": len(rows)}
+
+
+@router.post("/sites")
+def legacy_create_site(data: dict, request: Request):
+    return create_v1_site(data, request)
+
+
+@router.get("/sites")
+def legacy_list_sites():
+    with get_db() as db:
+        sites = db.execute("SELECT * FROM sites ORDER BY created_at DESC").fetchall()
+    return {"items": [_site_public(site) for site in sites]}
+
+
+@router.get("/sites/{site_id}/install-command")
+def legacy_install_command(site_id: str, request: Request):
+    with get_db() as db:
+        site = db.execute("SELECT * FROM sites WHERE id = ?", (site_id,)).fetchone()
+    if not site:
+        raise HTTPException(status_code=404, detail="Site not found")
+    return {"siteId": site_id, "command": _build_install_command(request, site_id, site["enrollment_token"])}
 
 
 @router.get("/status")
 def status():
-    return {
-        "status": "running" if is_sniffing() else "stopped",
-        "mode": "autonomous",
-        "eventsTracked": len(EVENTS),
-        "training": TRAINING_STATUS,
-    }
+    with get_db() as db:
+        site_count = db.execute("SELECT COUNT(*) AS count FROM sites").fetchone()["count"]
+        event_count = db.execute("SELECT COUNT(*) AS count FROM events").fetchone()["count"]
+    return {"status": "running", "mode": "api-first", "sites": site_count, "eventsTracked": event_count}
 
 
 @router.get("/logs")
 def logs(limit: int = 100, attack_type: Optional[str] = None):
-    items = EVENTS
+    query = "SELECT * FROM events"
+    params = []
     if attack_type:
-        normalized = attack_type.lower()
-        items = [event for event in items if event.get("attack", "").lower() == normalized]
-    return {"items": items[: max(1, min(limit, 500))], "total": len(items)}
-
-
-@router.post("/monitoring/start")
-def monitoring_start(data: Optional[dict] = None):
-    payload = data or {}
-    iface = payload.get("iface")
-    started = start_sniffing(_append_event, iface=iface)
-    return {"status": "started" if started else "already_running"}
-
-
-@router.post("/monitoring/stop")
-def monitoring_stop():
-    stopped = stop_sniffing()
-    return {"status": "stopped" if stopped else "already_stopped"}
-
-
-@router.post("/model/retrain")
-def model_retrain():
-    if TRAINING_STATUS["running"]:
-        return {"status": "already_running", "message": "Training is already in progress."}
-
-    def _run_training():
-        TRAINING_STATUS["running"] = True
-        TRAINING_STATUS["message"] = "Training started"
-        try:
-            train_model()
-            TRAINING_STATUS["message"] = "Training completed successfully"
-        except Exception as exc:
-            TRAINING_STATUS["message"] = f"Training failed: {exc}"
-        finally:
-            TRAINING_STATUS["running"] = False
-            TRAINING_STATUS["lastRun"] = datetime.now(timezone.utc).isoformat()
-
-    Thread(target=_run_training, daemon=True).start()
-    return {"status": "queued", "message": "Model retraining started in background."}
-
-
-@router.post("/sites")
-def create_site(data: dict):
-    site_id = f"site-{uuid4().hex[:12]}"
-    token = secrets.token_urlsafe(24)
-    site = {
-        "id": site_id,
-        "name": data.get("name", "Untitled Site"),
-        "domain": data.get("domain", ""),
-        "serverType": data.get("serverType", "nginx"),
-        "osType": data.get("osType", "linux"),
-        "mode": "monitor",
-        "createdAt": _iso_now(),
-        "token": token,
-        "lastHeartbeatAt": None,
-    }
-    SITES[site_id] = site
-    SITE_EVENTS[site_id] = []
-    return {
-        "site": {k: v for k, v in site.items() if k != "token"},
-        "agentToken": token,
-    }
-
-
-@router.get("/sites")
-def list_sites():
-    items = []
-    for site in SITES.values():
-        site_copy = {k: v for k, v in site.items() if k != "token"}
-        site_copy["eventCount"] = len(SITE_EVENTS.get(site["id"], []))
-        items.append(site_copy)
-    return {"items": items}
-
-
-@router.get("/sites/{site_id}/install-command")
-def site_install_command(site_id: str):
-    site = _require_site(site_id)
-    if not site:
-        return {"error": "Site not found"}
-    command = (
-        f"python -m pip install requests && python astra_agent.py "
-        f"--backend-url http://YOUR-ASTRA-SERVER:8000 "
-        f"--site-id {site_id} "
-        f"--token {site['token']}"
-    )
-    return {"siteId": site_id, "command": command}
-
-
-@router.patch("/sites/{site_id}/policy")
-def update_site_policy(site_id: str, data: dict):
-    site = _require_site(site_id)
-    if not site:
-        return {"error": "Site not found"}
-    mode = data.get("mode")
-    if mode in {"monitor", "autoprotect"}:
-        site["mode"] = mode
-    return {"site": {k: v for k, v in site.items() if k != "token"}}
-
-
-@router.get("/sites/{site_id}/overview")
-def site_overview(site_id: str):
-    site = _require_site(site_id)
-    if not site:
-        return {"error": "Site not found"}
-    events = SITE_EVENTS.get(site_id, [])
-    attacks = [e for e in events if str(e.get("attack", "")).lower() == "attack"]
-    return {
-        "siteId": site_id,
-        "status": "online" if site.get("lastHeartbeatAt") else "pending",
-        "totalEvents": len(events),
-        "attacksDetected": len(attacks),
-        "lastHeartbeatAt": site.get("lastHeartbeatAt"),
-        "mode": site.get("mode", "monitor"),
-    }
-
-
-@router.post("/agents/register")
-def agent_register(data: dict):
-    site_id = data.get("siteId")
-    token = data.get("token")
-    hostname = data.get("hostname", "unknown-host")
-    site = _require_site(site_id)
-    if not site or token != site.get("token"):
-        return {"status": "unauthorized"}
-    AGENTS[site_id] = {"hostname": hostname, "registeredAt": _iso_now()}
-    site["lastHeartbeatAt"] = _iso_now()
-    return {"status": "registered", "siteId": site_id}
-
-
-@router.post("/agents/heartbeat")
-def agent_heartbeat(data: dict):
-    site_id = data.get("siteId")
-    token = data.get("token")
-    site = _require_site(site_id)
-    if not site or token != site.get("token"):
-        return {"status": "unauthorized"}
-    site["lastHeartbeatAt"] = _iso_now()
-    return {"status": "ok", "mode": site.get("mode", "monitor")}
-
-
-@router.post("/agents/events")
-def agent_events(data: dict):
-    site_id = data.get("siteId")
-    token = data.get("token")
-    events = data.get("events", [])
-    site = _require_site(site_id)
-    if not site or token != site.get("token"):
-        return {"status": "unauthorized"}
-
-    site_buffer = SITE_EVENTS.setdefault(site_id, [])
-    for event in events:
-        event_obj = {
-            "id": event.get("id", f"agent-{uuid4().hex[:10]}"),
-            "timestamp": event.get("timestamp", _iso_now()),
-            "attack": event.get("attack", "Unknown"),
-            "explanation": event.get("explanation", "No explanation provided"),
-            "action": event.get("action", "Monitored"),
-            "sourceIp": event.get("sourceIp", "Unknown"),
-            "siteId": site_id,
-            "siteName": site.get("name"),
-        }
-        site_buffer.insert(0, event_obj)
-        EVENTS.insert(0, event_obj)
-
-    if len(site_buffer) > MAX_EVENTS:
-        del site_buffer[MAX_EVENTS:]
-    if len(EVENTS) > MAX_EVENTS:
-        del EVENTS[MAX_EVENTS:]
-
-    return {"status": "ok", "received": len(events)}
+        query += " WHERE attack_type = ?"
+        params.append(attack_type)
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(max(1, min(limit, 500)))
+    with get_db() as db:
+        rows = db.execute(query, params).fetchall()
+    return {"items": [row_to_dict(row) for row in rows], "total": len(rows)}

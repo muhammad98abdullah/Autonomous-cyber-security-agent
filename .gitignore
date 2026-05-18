@@ -27,6 +27,9 @@ pip-wheel-metadata/
 # --- Logs / runtime ---
 *.log
 *.pid
+*.db
+*.sqlite
+*.sqlite3
 
 # --- OS / editor ---
 .DS_Store
