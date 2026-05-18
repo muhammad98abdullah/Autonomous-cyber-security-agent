@@ -2,6 +2,14 @@ const API_BASE_KEY = "astra_api_base";
 const SESSION_KEY = "astra_session";
 const SITES_KEY = "astra_sites";
 
+function defaultApiBase() {
+  const host = window.location.hostname;
+  if (host === "127.0.0.1" || host === "localhost" || host === "") {
+    return "http://127.0.0.1:8000";
+  }
+  return window.location.origin;
+}
+
 const state = {
   view: "overview",
   session: readJson(SESSION_KEY, null),
@@ -10,7 +18,7 @@ const state = {
   events: {},
   selectedSiteId: null,
   selectedEvent: null,
-  apiBase: localStorage.getItem(API_BASE_KEY) || "http://127.0.0.1:8000",
+  apiBase: localStorage.getItem(API_BASE_KEY) || defaultApiBase(),
   loading: false,
 };
 
