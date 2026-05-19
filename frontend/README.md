@@ -31,6 +31,8 @@ http://127.0.0.1:5173
 3. Create a website.
 4. Copy the generated Linux agent install command.
 5. Open `Protected Sites`.
-6. Click `Demo Threat` to show the danger dashboard flow without a real VPS.
+6. Use authorized curl/k6 traffic from a separate machine to trigger brute-force or DoS detections.
+7. Open `Blocked IPs` to see what ASTRA blocked and why.
+8. Open `Allowlist` before testing from your own/admin IP.
 
 The frontend calls the real backend APIs and does not modify backend code.

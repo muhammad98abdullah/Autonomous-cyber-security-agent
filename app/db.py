@@ -81,6 +81,9 @@ def init_db():
                 site_id TEXT NOT NULL,
                 event_id TEXT,
                 source_ip TEXT NOT NULL,
+                attack_type TEXT NOT NULL DEFAULT '',
+                rule_id TEXT NOT NULL DEFAULT '',
+                ports TEXT NOT NULL DEFAULT '[]',
                 action TEXT NOT NULL,
                 status TEXT NOT NULL,
                 message TEXT NOT NULL DEFAULT '',
@@ -88,8 +91,39 @@ def init_db():
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS allowlist (
+                id TEXT PRIMARY KEY,
+                site_id TEXT NOT NULL,
+                ip TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE(site_id, ip),
+                FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS commands (
+                id TEXT PRIMARY KEY,
+                site_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                source_ip TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                message TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
+            );
             """
         )
+        _ensure_column(db, "blocks", "attack_type", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(db, "blocks", "rule_id", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(db, "blocks", "ports", "TEXT NOT NULL DEFAULT '[]'")
+
+
+def _ensure_column(db, table, column, definition):
+    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def row_to_dict(row):

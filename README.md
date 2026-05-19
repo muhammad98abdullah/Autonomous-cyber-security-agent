@@ -60,7 +60,7 @@ The installer creates:
 - `/var/lib/astra-agent/`
 - `astra-agent.service`
 
-The agent watches nginx/apache logs, detects suspicious web traffic, reports events, and applies 24-hour UFW blocks when the backend requests protection.
+The agent watches nginx/apache logs, detects suspicious web traffic, reports events, and applies 24-hour web-only UFW blocks when the backend requests protection.
 
 ## Dashboard Health API
 
@@ -97,12 +97,28 @@ Danger response:
 
 ## Agent Detection MVP
 
-The first version detects:
+The current version focuses on reliable, demo-ready detection for:
 
-- suspicious paths such as `/.env`, `/wp-login.php`, `/phpmyadmin`, and `/.git`
-- SQL injection and path traversal-looking payloads
-- repeated login attempts
-- repeated suspicious HTTP status codes
-- high request rate from a single IP
+- brute force attempts against login/admin paths such as `/wp-login.php`, `/xmlrpc.php`, `/login`, and `/admin`
+- web-layer DoS / HTTP floods from a single IP, the same path, or total site traffic spikes
+- suspicious sensitive-file scans such as `/.env`, `/phpmyadmin`, `/.git`, and backup/config paths
+- suspicious payloads such as SQL injection-looking text, XSS-looking text, command parameters, and path traversal
+
+When ASTRA blocks an IP, it blocks website access only:
+
+```bash
+ufw deny from ATTACKER_IP to any port 80
+ufw deny from ATTACKER_IP to any port 443
+```
+
+This protects the website while reducing the chance of blocking SSH access.
+
+## Blocklist And Allowlist
+
+The frontend includes:
+
+- `Blocked IPs`: shows IPs ASTRA blocked, why they were blocked, target ports, status, and expiry.
+- `Allowlist`: lets the user add trusted IPs for admin/testing. Allowlisted IPs are detected but never blocked.
+- Manual unblock: queues an unblock command for the agent; the agent applies it on heartbeat and reports the result.
 
 Packet capture and advanced ML training are later phases after the log-based agent is stable.

@@ -16,6 +16,8 @@ const state = {
   sites: readJson(SITES_KEY, []),
   health: {},
   events: {},
+  blocks: {},
+  allowlist: {},
   selectedSiteId: null,
   selectedEvent: null,
   apiBase: localStorage.getItem(API_BASE_KEY) || defaultApiBase(),
@@ -45,6 +47,10 @@ const icons = {
     '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>',
   logout:
     '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5c0-1.1.9-2 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></svg>',
+  list:
+    '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg>',
+  userCheck:
+    '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="m16 11 2 2 4-4"/></svg>',
 };
 
 function readJson(key, fallback) {
@@ -123,12 +129,16 @@ async function refreshAll() {
 async function refreshSite(site) {
   if (!site.dashboardToken) return;
   const headers = { Authorization: `Bearer ${site.dashboardToken}` };
-  const [health, events] = await Promise.all([
+  const [health, events, blocks, allowlist] = await Promise.all([
     api(`/v1/sites/${site.id}/health`, { headers }),
     api(`/v1/sites/${site.id}/events?limit=50`, { headers }),
+    api(`/v1/sites/${site.id}/blocks?limit=100`, { headers }),
+    api(`/v1/sites/${site.id}/allowlist`, { headers }),
   ]);
   state.health[site.id] = health;
   state.events[site.id] = events.items || [];
+  state.blocks[site.id] = blocks.items || [];
+  state.allowlist[site.id] = allowlist.items || [];
 }
 
 async function createSite(event) {
@@ -162,58 +172,6 @@ async function createSite(event) {
   } finally {
     state.loading = false;
     render();
-  }
-}
-
-async function generateDemoThreat(site) {
-  try {
-    let agentToken = site.demoAgentToken;
-    if (!agentToken) {
-      const enrolled = await api("/v1/agents/enroll", {
-        method: "POST",
-        body: JSON.stringify({
-          siteId: site.id,
-          enrollToken: site.enrollmentToken,
-          hostname: "dashboard-demo",
-          version: "frontend-demo",
-        }),
-      });
-      agentToken = enrolled.agentToken;
-      site.demoAgentToken = agentToken;
-      saveSites();
-    }
-    await api("/v1/agents/heartbeat", {
-      method: "POST",
-      body: JSON.stringify({ siteId: site.id, agentToken }),
-    });
-    await api("/v1/agents/events", {
-      method: "POST",
-      body: JSON.stringify({
-        siteId: site.id,
-        agentToken,
-        events: [
-          {
-            attackType: "web_scan",
-            severity: "high",
-            sourceIp: "8.8.8.8",
-            method: "GET",
-            path: "/.env",
-            statusCode: 404,
-            userAgent: "curl/8 demo",
-            ruleId: "suspicious_path",
-            eventCount: 1,
-            sampleLines: [
-              '8.8.8.8 - - "GET /.env HTTP/1.1" 404 123 "-" "curl/8 demo"',
-            ],
-          },
-        ],
-      }),
-    });
-    await refreshSite(site);
-    toast("Demo threat added. ASTRA marked it as danger.");
-    render();
-  } catch (error) {
-    toast(error.message);
   }
 }
 
@@ -309,6 +267,8 @@ function renderShell() {
     ["connect", icons.plug, "Connect Site"],
     ["sites", icons.server, "Protected Sites"],
     ["threats", icons.alert, "Threats"],
+    ["blocks", icons.list, "Blocked IPs"],
+    ["allowlist", icons.userCheck, "Allowlist"],
     ["guidance", icons.shield, "Prevention"],
     ["settings", icons.lock, "Settings"],
   ];
@@ -336,7 +296,7 @@ function renderShell() {
         <header class="topbar">
           <div class="page-title">
             <h1>${pageName}</h1>
-            <span>${state.session.name} · ${state.session.email}</span>
+            <span>${state.session.name} &middot; ${state.session.email}</span>
           </div>
           <div class="row-actions">
             <button class="secondary-btn" data-action="refresh">${icons.refresh} Refresh</button>
@@ -354,6 +314,8 @@ function renderView() {
   if (state.view === "connect") return renderConnect();
   if (state.view === "sites") return renderSites();
   if (state.view === "threats") return renderThreats();
+  if (state.view === "blocks") return renderBlocks();
+  if (state.view === "allowlist") return renderAllowlist();
   if (state.view === "guidance") return renderGuidance();
   if (state.view === "settings") return renderSettings();
   return renderOverview();
@@ -369,11 +331,76 @@ function allEvents() {
   );
 }
 
+function allBlocks() {
+  return state.sites.flatMap((site) =>
+    (state.blocks[site.id] || []).map((block) => ({ ...block, siteName: site.name, siteId: site.id }))
+  );
+}
+
+function allAllowedIps() {
+  return state.sites.flatMap((site) =>
+    (state.allowlist[site.id] || []).map((item) => ({ ...item, siteName: site.name, siteId: site.id }))
+  );
+}
+
+async function addAllowlist(event) {
+  event.preventDefault();
+  const site = currentSite();
+  if (!site) return toast("Create a site first.");
+  const form = new FormData(event.currentTarget);
+  try {
+    await api(`/v1/sites/${site.id}/allowlist`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${site.dashboardToken}` },
+      body: JSON.stringify({ ip: form.get("ip"), label: form.get("label") }),
+    });
+    event.currentTarget.reset();
+    await refreshSite(site);
+    toast("IP added to allowlist.");
+    render();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function removeAllowlist(siteId, ip) {
+  const site = state.sites.find((item) => item.id === siteId);
+  if (!site) return;
+  try {
+    await api(`/v1/sites/${site.id}/allowlist/${encodeURIComponent(ip)}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${site.dashboardToken}` },
+    });
+    await refreshSite(site);
+    toast("IP removed from allowlist.");
+    render();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function requestUnblock(siteId, ip) {
+  const site = state.sites.find((item) => item.id === siteId);
+  if (!site) return;
+  try {
+    await api(`/v1/sites/${site.id}/blocks/${encodeURIComponent(ip)}/unblock`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${site.dashboardToken}` },
+    });
+    toast("Unblock command queued. Agent will apply it on heartbeat.");
+    await refreshSite(site);
+    render();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
 function renderOverview() {
   const healthList = allHealth();
   const danger = healthList.find((item) => item.status === "danger");
   const activeDangerCount = healthList.reduce((total, item) => total + (item.activeDangerCount || 0), 0);
   const activeBlocks = healthList.reduce((total, item) => total + (item.activeBlocks || 0), 0);
+  const allowCount = allAllowedIps().length;
   const online = healthList.filter((item) => item.agentOnline).length;
   const statusWord = danger ? "Danger detected" : state.sites.length ? "Protected" : "Ready to connect";
   const heroCopy = danger
@@ -398,6 +425,7 @@ function renderOverview() {
       ${statCard(icons.activity, online, "Agents online", "var(--green)")}
       ${statCard(icons.alert, activeDangerCount, "Active dangers", danger ? "var(--red)" : "var(--cyan)")}
       ${statCard(icons.lock, activeBlocks, "Active blocks", "var(--violet)")}
+      ${statCard(icons.userCheck, allowCount, "Allowed IPs", "var(--amber)")}
     </section>
     <section class="grid two-col">
       <div class="panel">
@@ -526,7 +554,7 @@ function renderSiteCard(site) {
       </div>
       <div class="row-actions">
         <button class="secondary-btn" data-site="${site.id}" data-view="threats">${icons.alert} Threats</button>
-        <button class="ghost-btn" data-demo="${site.id}">${icons.bolt} Demo Threat</button>
+        <button class="ghost-btn" data-site="${site.id}" data-view="blocks">${icons.list} Blocks</button>
         <button class="icon-btn" title="Copy install command" data-copy="${escapeHtml(site.installCommand)}">${icons.copy}</button>
       </div>
     </article>
@@ -554,7 +582,6 @@ function renderThreats() {
       <div class="panel">
         <div class="section-title">
           <div><h2>Threat Timeline</h2><span>${site ? escapeHtml(site.name) : "All sites"}</span></div>
-          ${site ? `<button class="danger-btn" data-demo="${site.id}">${icons.bolt} Demo Threat</button>` : ""}
         </div>
         ${renderEventList(siteEvents)}
       </div>
@@ -564,6 +591,129 @@ function renderThreats() {
         </div>
         ${site ? renderSiteCard(site) : `<div class="empty-state"><div><strong>Select a site</strong><span>Add a website first.</span></div></div>`}
       </div>
+    </section>
+  `;
+}
+
+function renderBlocks() {
+  const site = currentSite();
+  const blocks = site ? state.blocks[site.id] || [] : allBlocks();
+  return `
+    <section class="panel">
+      <div class="section-title">
+        <div>
+          <h2>Blocked IPs</h2>
+          <span>ASTRA records web-port blocks and manual unblock activity</span>
+        </div>
+        <button class="secondary-btn" data-action="refresh">${icons.refresh} Refresh</button>
+      </div>
+      ${
+        blocks.length
+          ? `<div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>IP Address</th>
+                    <th>Attack</th>
+                    <th>Reason</th>
+                    <th>Ports</th>
+                    <th>Status</th>
+                    <th>Expires</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${blocks.map(renderBlockRow).join("")}
+                </tbody>
+              </table>
+            </div>`
+          : `<div class="empty-state"><div><strong>No block records yet</strong><span>When ASTRA blocks or unblocks an IP, it appears here.</span></div></div>`
+      }
+    </section>
+  `;
+}
+
+function renderBlockRow(block) {
+  const ports = Array.isArray(block.ports) ? block.ports.join(", ") : "80, 443";
+  const canUnblock = block.action === "block" && block.status === "success";
+  return `
+    <tr>
+      <td><strong>${escapeHtml(block.source_ip || block.sourceIp || "Unknown")}</strong></td>
+      <td>${titleCase(block.attack_type || "Security Event")}</td>
+      <td>${escapeHtml(block.rule_id || block.message || "Policy action")}</td>
+      <td>${escapeHtml(ports)}</td>
+      <td><span class="pill ${block.status === "success" ? "ok" : block.status === "failed" ? "danger" : "pending"}">${escapeHtml(block.action || "block")} &middot; ${escapeHtml(block.status || "unknown")}</span></td>
+      <td>${formatTime(block.expires_at)}</td>
+      <td>
+        ${
+          canUnblock
+            ? `<button class="secondary-btn" data-unblock="${escapeHtml(block.source_ip)}" data-site-id="${escapeHtml(block.site_id || block.siteId || currentSite()?.id || "")}">Unblock</button>`
+            : `<span class="subtle">No action</span>`
+        }
+      </td>
+    </tr>
+  `;
+}
+
+function renderAllowlist() {
+  const site = currentSite();
+  const items = site ? state.allowlist[site.id] || [] : [];
+  return `
+    <section class="grid two-col">
+      <form class="panel" id="allowForm">
+        <div class="section-title">
+          <div><h2>Allowed IPs</h2><span>Trusted IPs are detected but never blocked</span></div>
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label>IP Address</label>
+            <input name="ip" placeholder="203.0.113.10" required />
+          </div>
+          <div class="field">
+            <label>Label</label>
+            <input name="label" placeholder="My office / professor test IP" />
+          </div>
+          <button class="primary-btn full" type="submit">${icons.userCheck} Add To Allowlist</button>
+        </div>
+      </form>
+      <div class="panel">
+        <div class="section-title">
+          <div><h2>Safety Policy</h2><span>Useful during live demos and admin testing</span></div>
+        </div>
+        <div class="setup-list">
+          ${setupStep(1, "Never block trusted IPs", "The backend sends the allowlist to the agent on heartbeat.")}
+          ${setupStep(2, "Still record detections", "Suspicious activity can be shown without locking out the trusted user.")}
+          ${setupStep(3, "Use for demos", "Add your own IP before running aggressive curl/k6 tests.")}
+        </div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="section-title">
+        <div><h2>${site ? escapeHtml(site.name) : "Site"} Allowlist</h2><span>Current trusted sources</span></div>
+      </div>
+      ${
+        items.length
+          ? `<div class="table-wrap">
+              <table>
+                <thead><tr><th>IP Address</th><th>Label</th><th>Created</th><th>Action</th></tr></thead>
+                <tbody>
+                  ${items
+                    .map(
+                      (item) => `
+                        <tr>
+                          <td><strong>${escapeHtml(item.ip)}</strong></td>
+                          <td>${escapeHtml(item.label || "Trusted IP")}</td>
+                          <td>${formatTime(item.created_at)}</td>
+                          <td><button class="danger-btn" data-remove-allow="${escapeHtml(item.ip)}" data-site-id="${escapeHtml(site?.id || "")}">Remove</button></td>
+                        </tr>
+                      `
+                    )
+                    .join("")}
+                </tbody>
+              </table>
+            </div>`
+          : `<div class="empty-state"><div><strong>No allowed IPs yet</strong><span>Add your own IP before testing brute force or DoS traffic.</span></div></div>`
+      }
     </section>
   `;
 }
@@ -585,7 +735,7 @@ function renderEventCard(event) {
         <header>
           <div>
             <h3>${titleCase(event.attack_type || event.attackType || "Security Event")}</h3>
-            <span class="subtle">${escapeHtml(event.source_ip || event.sourceIp || "Unknown IP")} · ${formatTime(event.timestamp || event.created_at)}</span>
+            <span class="subtle">${escapeHtml(event.source_ip || event.sourceIp || "Unknown IP")} &middot; ${formatTime(event.timestamp || event.created_at)}</span>
           </div>
           <span class="severity ${severity}">${severity.toUpperCase()}</span>
         </header>
@@ -628,7 +778,7 @@ function renderGuidance() {
         `
               )
               .join("")
-          : `<div class="empty-state"><div><strong>No event advice yet</strong><span>Generate a demo threat or connect the agent to see tailored recommendations.</span></div></div>`
+          : `<div class="empty-state"><div><strong>No event advice yet</strong><span>Connect the agent and run authorized test traffic to see tailored recommendations.</span></div></div>`
       }
     </section>
   `;
@@ -708,6 +858,7 @@ function renderDrawer() {
 function bindEvents() {
   document.querySelector("#loginForm")?.addEventListener("submit", login);
   document.querySelector("#siteForm")?.addEventListener("submit", createSite);
+  document.querySelector("#allowForm")?.addEventListener("submit", addAllowlist);
 
   document.querySelectorAll("[data-view]").forEach((button) => {
     button.addEventListener("click", () => setView(button.dataset.view, button.dataset.site));
@@ -717,18 +868,19 @@ function bindEvents() {
     button.addEventListener("click", () => copyText(button.dataset.copy, "Install command copied."));
   });
 
-  document.querySelectorAll("[data-demo]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const site = state.sites.find((item) => item.id === button.dataset.demo);
-      if (site) await generateDemoThreat(site);
-    });
-  });
-
   document.querySelectorAll("[data-event]").forEach((button) => {
     button.addEventListener("click", () => {
       state.selectedEvent = allEvents().find((event) => event.id === button.dataset.event);
       render();
     });
+  });
+
+  document.querySelectorAll("[data-unblock]").forEach((button) => {
+    button.addEventListener("click", () => requestUnblock(button.dataset.siteId, button.dataset.unblock));
+  });
+
+  document.querySelectorAll("[data-remove-allow]").forEach((button) => {
+    button.addEventListener("click", () => removeAllowlist(button.dataset.siteId, button.dataset.removeAllow));
   });
 
   document.querySelector("[data-action='refresh']")?.addEventListener("click", refreshAll);
@@ -753,6 +905,8 @@ function bindEvents() {
     state.sites = [];
     state.health = {};
     state.events = {};
+    state.blocks = {};
+    state.allowlist = {};
     render();
   });
 }

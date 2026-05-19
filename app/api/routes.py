@@ -84,10 +84,51 @@ def _normalize_severity(value):
     return value if value in {"low", "medium", "high", "critical"} else "medium"
 
 
-def _should_block(event):
+def _validate_ip(value):
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _site_allowlist(db, site_id: str):
+    rows = db.execute("SELECT ip FROM allowlist WHERE site_id = ?", (site_id,)).fetchall()
+    return {row["ip"] for row in rows}
+
+
+def _should_block(event, allowlist=None):
     severity = _normalize_severity(event.get("severity"))
     source_ip = event.get("sourceIp") or event.get("source_ip") or ""
-    return severity in {"high", "critical"} and _is_public_ip(source_ip)
+    return severity in {"high", "critical"} and _is_public_ip(source_ip) and source_ip not in (allowlist or set())
+
+
+def _active_blocks_count(db, site_id: str):
+    return db.execute(
+        """
+        SELECT COUNT(DISTINCT b.source_ip) AS count
+        FROM blocks b
+        WHERE b.site_id = ?
+        AND b.action = 'block'
+        AND b.status = 'success'
+        AND (b.expires_at IS NULL OR b.expires_at > ?)
+        AND NOT EXISTS (
+            SELECT 1 FROM blocks u
+            WHERE u.site_id = b.site_id
+            AND u.source_ip = b.source_ip
+            AND u.action = 'unblock'
+            AND u.status = 'success'
+            AND u.created_at > b.created_at
+        )
+        """,
+        (site_id, _iso_now()),
+    ).fetchone()["count"]
+
+
+def _block_public(row):
+    item = row_to_dict(row)
+    item["ports"] = json_loads(item.get("ports"))
+    return item
 
 
 def _build_install_command(request: Request, site_id: str, enrollment_token: str):
@@ -250,7 +291,21 @@ def agent_heartbeat(data: dict):
         db.execute("UPDATE sites SET last_heartbeat_at = ? WHERE id = ?", (now, site_id))
         db.execute("UPDATE agents SET last_heartbeat_at = ? WHERE site_id = ?", (now, site_id))
         site = db.execute("SELECT * FROM sites WHERE id = ?", (site_id,)).fetchone()
-    return {"status": "ok", "mode": site["mode"], "blockDurationHours": BLOCK_DURATION_HOURS}
+        allowlist = sorted(_site_allowlist(db, site_id))
+        commands = [
+            row_to_dict(row)
+            for row in db.execute(
+                "SELECT id, type, source_ip AS sourceIp FROM commands WHERE site_id = ? AND status = 'pending' ORDER BY created_at ASC",
+                (site_id,),
+            ).fetchall()
+        ]
+    return {
+        "status": "ok",
+        "mode": site["mode"],
+        "blockDurationHours": BLOCK_DURATION_HOURS,
+        "allowlist": allowlist,
+        "commands": commands,
+    }
 
 
 @router.post("/v1/agents/events")
@@ -262,6 +317,7 @@ def agent_events(data: dict):
     responses = []
     now = _iso_now()
     with get_db() as db:
+        allowlist = _site_allowlist(db, site_id)
         for event in events:
             event_id = event.get("id") or f"evt_{uuid4().hex[:12]}"
             attack_type = event.get("attackType") or event.get("attack_type") or "unknown"
@@ -275,8 +331,14 @@ def agent_events(data: dict):
                 "siteName": site["name"],
             }
             advice = explain_security_event(enriched_event)
-            should_block = site["mode"] == "autoprotect" and _should_block(enriched_event)
-            action_taken = "Block requested" if should_block else "Monitored"
+            is_allowlisted = source_ip in allowlist
+            should_block = site["mode"] == "autoprotect" and _should_block(enriched_event, allowlist)
+            if should_block:
+                action_taken = "Block requested on web ports 80/443"
+            elif is_allowlisted and severity in {"high", "critical"}:
+                action_taken = "Detected but not blocked: IP is allowlisted"
+            else:
+                action_taken = "Monitored"
             db.execute(
                 """
                 INSERT OR REPLACE INTO events (
@@ -312,9 +374,13 @@ def agent_events(data: dict):
                     "eventId": event_id,
                     "block": should_block,
                     "blockDurationHours": BLOCK_DURATION_HOURS,
+                    "ports": [80, 443],
+                    "attackType": attack_type,
+                    "ruleId": event.get("ruleId"),
                     "explanation": advice["explanation"],
                     "solutions": advice["solutions"],
                     "action": action_taken,
+                    "reason": "allowlisted" if is_allowlisted else "policy",
                 }
             )
         db.execute(
@@ -339,20 +405,45 @@ def block_result(data: dict):
         db.execute(
             """
             INSERT INTO blocks (
-                id, site_id, event_id, source_ip, action, status, message, expires_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                id, site_id, event_id, source_ip, attack_type, rule_id, ports,
+                action, status, message, expires_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 data.get("id") or f"blk_{uuid4().hex[:12]}",
                 site_id,
                 data.get("eventId"),
                 data.get("sourceIp") or "Unknown",
+                data.get("attackType") or "",
+                data.get("ruleId") or "",
+                json_dumps(data.get("ports") or [80, 443]),
                 data.get("action") or "block",
                 data.get("status") or "unknown",
                 data.get("message") or "",
                 data.get("expiresAt"),
                 now,
             ),
+        )
+    return {"status": "ok"}
+
+
+@router.post("/v1/agents/command-result")
+def command_result(data: dict):
+    site_id = data.get("siteId")
+    token = data.get("agentToken")
+    _require_agent(site_id, token)
+    command_id = data.get("commandId")
+    if not command_id:
+        raise HTTPException(status_code=400, detail="commandId is required")
+    now = _iso_now()
+    with get_db() as db:
+        db.execute(
+            """
+            UPDATE commands
+            SET status = ?, message = ?, completed_at = ?
+            WHERE id = ? AND site_id = ?
+            """,
+            (data.get("status") or "unknown", data.get("message") or "", now, command_id, site_id),
         )
     return {"status": "ok"}
 
@@ -373,14 +464,7 @@ def site_health(site_id: str, authorization: Optional[str] = Header(default=None
             """,
             (site_id,),
         ).fetchall()
-        active_blocks = db.execute(
-            """
-            SELECT COUNT(*) AS count FROM blocks
-            WHERE site_id = ? AND action = 'block' AND status = 'success'
-            AND (expires_at IS NULL OR expires_at > ?)
-            """,
-            (site_id, _iso_now()),
-        ).fetchone()["count"]
+        active_blocks = _active_blocks_count(db, site_id)
 
     active_events = [row_to_dict(row) for row in rows]
     high_events = [e for e in active_events if e["severity"] in {"high", "critical"}]
@@ -419,6 +503,81 @@ def site_events(site_id: str, authorization: Optional[str] = Header(default=None
             (site_id, max(1, min(limit, 500))),
         ).fetchall()
     return {"items": [row_to_dict(row) for row in rows], "total": len(rows)}
+
+
+@router.get("/v1/sites/{site_id}/blocks")
+def site_blocks(site_id: str, authorization: Optional[str] = Header(default=None), limit: int = 100):
+    _require_dashboard(site_id, authorization)
+    with get_db() as db:
+        rows = db.execute(
+            """
+            SELECT * FROM blocks
+            WHERE site_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (site_id, max(1, min(limit, 500))),
+        ).fetchall()
+    return {"items": [_block_public(row) for row in rows], "total": len(rows)}
+
+
+@router.post("/v1/sites/{site_id}/blocks/{source_ip}/unblock")
+def request_unblock(site_id: str, source_ip: str, authorization: Optional[str] = Header(default=None)):
+    _require_dashboard(site_id, authorization)
+    if not _validate_ip(source_ip):
+        raise HTTPException(status_code=400, detail="Invalid IP address")
+    command_id = f"cmd_{uuid4().hex[:12]}"
+    now = _iso_now()
+    with get_db() as db:
+        db.execute(
+            """
+            INSERT INTO commands (id, site_id, type, source_ip, status, created_at)
+            VALUES (?, ?, 'unblock', ?, 'pending', ?)
+            """,
+            (command_id, site_id, source_ip, now),
+        )
+    return {"status": "queued", "commandId": command_id, "sourceIp": source_ip}
+
+
+@router.get("/v1/sites/{site_id}/allowlist")
+def get_allowlist(site_id: str, authorization: Optional[str] = Header(default=None)):
+    _require_dashboard(site_id, authorization)
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT * FROM allowlist WHERE site_id = ? ORDER BY created_at DESC",
+            (site_id,),
+        ).fetchall()
+    return {"items": [row_to_dict(row) for row in rows], "total": len(rows)}
+
+
+@router.post("/v1/sites/{site_id}/allowlist")
+def add_allowlist(site_id: str, data: dict, authorization: Optional[str] = Header(default=None)):
+    _require_dashboard(site_id, authorization)
+    ip = str(data.get("ip") or "").strip()
+    if not _validate_ip(ip):
+        raise HTTPException(status_code=400, detail="Invalid IP address")
+    now = _iso_now()
+    with get_db() as db:
+        db.execute(
+            """
+            INSERT INTO allowlist (id, site_id, ip, label, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(site_id, ip) DO UPDATE SET
+                label = excluded.label
+            """,
+            (f"allow_{uuid4().hex[:12]}", site_id, ip, data.get("label") or "", now),
+        )
+    return {"status": "ok", "ip": ip}
+
+
+@router.delete("/v1/sites/{site_id}/allowlist/{ip}")
+def remove_allowlist(site_id: str, ip: str, authorization: Optional[str] = Header(default=None)):
+    _require_dashboard(site_id, authorization)
+    if not _validate_ip(ip):
+        raise HTTPException(status_code=400, detail="Invalid IP address")
+    with get_db() as db:
+        db.execute("DELETE FROM allowlist WHERE site_id = ? AND ip = ?", (site_id, ip))
+    return {"status": "ok", "ip": ip}
 
 
 @router.post("/sites")

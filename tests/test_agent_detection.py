@@ -18,7 +18,7 @@ class AgentDetectionTests(unittest.TestCase):
         record = {
             "sourceIp": "8.8.8.8",
             "method": "GET",
-            "path": "/wp-login.php",
+            "path": "/.env",
             "statusCode": 404,
             "userAgent": "curl",
             "raw": "sample",
@@ -26,9 +26,45 @@ class AgentDetectionTests(unittest.TestCase):
 
         event = detector.inspect(record)
 
-        self.assertEqual(event["attackType"], "web_scan")
+        self.assertEqual(event["attackType"], "sensitive_file_scan")
         self.assertEqual(event["severity"], "high")
-        self.assertEqual(event["ruleId"], "suspicious_path")
+        self.assertEqual(event["ruleId"], "sensitive_path_scan")
+
+    def test_repeated_login_creates_brute_force_event(self):
+        detector = Detector()
+        event = None
+        for _ in range(8):
+            event = detector.inspect(
+                {
+                    "sourceIp": "8.8.8.8",
+                    "method": "POST",
+                    "path": "/wp-login.php",
+                    "statusCode": 403,
+                    "userAgent": "curl",
+                    "raw": "sample",
+                }
+            )
+
+        self.assertEqual(event["attackType"], "brute_force")
+        self.assertEqual(event["ruleId"], "repeated_login_attempts")
+
+    def test_request_flood_creates_dos_event(self):
+        detector = Detector()
+        event = None
+        for _ in range(120):
+            event = detector.inspect(
+                {
+                    "sourceIp": "8.8.8.8",
+                    "method": "GET",
+                    "path": "/",
+                    "statusCode": 200,
+                    "userAgent": "curl",
+                    "raw": "sample",
+                }
+            )
+
+        self.assertEqual(event["attackType"], "dos_http_flood")
+        self.assertEqual(event["ruleId"], "single_ip_flood")
 
     def test_normal_request_returns_no_event(self):
         detector = Detector()

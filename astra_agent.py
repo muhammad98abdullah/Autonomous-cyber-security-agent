@@ -23,11 +23,19 @@ DEFAULT_LOG_PATHS = [
 ]
 SUSPICIOUS_PATHS = (
     "/.env",
-    "/wp-login.php",
-    "/xmlrpc.php",
     "/phpmyadmin",
     "/.git",
+    "/backup",
+    "/config",
+    "/server-status",
+)
+LOGIN_PATHS = (
+    "/wp-login.php",
+    "/xmlrpc.php",
+    "/login",
     "/admin",
+    "/user/login",
+    "/account/login",
 )
 PAYLOAD_PATTERNS = (
     "../",
@@ -40,6 +48,7 @@ PAYLOAD_PATTERNS = (
     "cmd=",
 )
 STATUS_SPIKE_CODES = {401, 403, 404, 429, 500}
+WEB_BLOCK_PORTS = [80, 443]
 
 
 def now_iso():
@@ -128,6 +137,8 @@ class Detector:
         self.ip_hits = defaultdict(lambda: deque(maxlen=300))
         self.status_hits = defaultdict(lambda: deque(maxlen=100))
         self.login_hits = defaultdict(lambda: deque(maxlen=100))
+        self.path_hits = defaultdict(lambda: deque(maxlen=700))
+        self.site_hits = deque(maxlen=1200)
 
     def inspect(self, record):
         if not record:
@@ -138,27 +149,54 @@ class Detector:
         ts = datetime.now(timezone.utc)
 
         self.ip_hits[source_ip].append((ts, record))
+        self.path_hits[path].append((ts, record))
+        self.site_hits.append((ts, record))
         if status in STATUS_SPIKE_CODES:
             self.status_hits[(source_ip, status)].append((ts, record))
-        if "login" in path or "wp-login.php" in path or "xmlrpc.php" in path:
+        if self._is_login_path(path):
             self.login_hits[source_ip].append((ts, record))
 
+        login_count = self._recent_count(self.login_hits[source_ip], ts, 300)
+        failed_auth_count = self._recent_status_count(source_ip, ts, 300, {401, 403, 429})
+        ip_count = self._recent_count(self.ip_hits[source_ip], ts, 60)
+        path_count = self._recent_count(self.path_hits[path], ts, 60) if path else 0
+        site_count = self._recent_count(self.site_hits, ts, 60)
+
+        if login_count >= 8:
+            return self._event("brute_force", "high", "repeated_login_attempts", record, login_count)
+        if failed_auth_count >= 10:
+            return self._event("brute_force", "high", "repeated_auth_failures", record, failed_auth_count)
+        if ip_count >= 300:
+            return self._event("dos_http_flood", "critical", "single_ip_flood_critical", record, ip_count)
+        if ip_count >= 120:
+            return self._event("dos_http_flood", "high", "single_ip_flood", record, ip_count)
+        if path and path_count >= 250:
+            return self._event("dos_http_flood", "high", "same_path_flood", record, path_count)
+        if site_count >= 600:
+            return self._event("dos_http_flood", "critical", "site_wide_request_flood", record, site_count)
         if any(marker in path for marker in SUSPICIOUS_PATHS):
-            return self._event("web_scan", "high", "suspicious_path", record, 1)
+            return self._event("sensitive_file_scan", "high", "sensitive_path_scan", record, 1)
         if any(marker in path for marker in PAYLOAD_PATTERNS):
             return self._event("suspicious_payload", "critical", "suspicious_payload", record, 1)
-        if self._recent_count(self.login_hits[source_ip], ts, 300) >= 8:
-            return self._event("brute_force", "high", "repeated_login", record, self._recent_count(self.login_hits[source_ip], ts, 300))
         if status in STATUS_SPIKE_CODES and self._recent_count(self.status_hits[(source_ip, status)], ts, 120) >= 15:
             return self._event("web_scan", "high", f"status_{status}_spike", record, self._recent_count(self.status_hits[(source_ip, status)], ts, 120))
-        if self._recent_count(self.ip_hits[source_ip], ts, 60) >= 120:
-            return self._event("request_flood", "critical", "high_request_rate", record, self._recent_count(self.ip_hits[source_ip], ts, 60))
         return None
+
+    @staticmethod
+    def _is_login_path(path):
+        return any(marker in path for marker in LOGIN_PATHS)
 
     @staticmethod
     def _recent_count(items, ts, seconds):
         cutoff = ts - timedelta(seconds=seconds)
         return sum(1 for item_ts, _ in items if item_ts >= cutoff)
+
+    def _recent_status_count(self, source_ip, ts, seconds, statuses):
+        cutoff = ts - timedelta(seconds=seconds)
+        count = 0
+        for status in statuses:
+            count += sum(1 for item_ts, _ in self.status_hits[(source_ip, status)] if item_ts >= cutoff)
+        return count
 
     @staticmethod
     def _event(attack_type, severity, rule_id, record, count):
@@ -219,6 +257,7 @@ class AstraAgent:
         self.tailer = LogTailer(config.get("log_paths") or DEFAULT_LOG_PATHS)
         self.queue = load_json(self.queue_path, [])
         self.blocks = load_json(self.blocks_path, {})
+        self.allowlist = set(config.get("allowlist") or [])
 
     @property
     def agent_token(self):
@@ -248,7 +287,9 @@ class AstraAgent:
         payload = {"siteId": self.site_id, "agentToken": self.agent_token}
         response = requests.post(f"{self.backend_url}/v1/agents/heartbeat", json=payload, timeout=15)
         response.raise_for_status()
-        return response.json()
+        body = response.json()
+        self.allowlist = set(body.get("allowlist") or [])
+        return body
 
     def enqueue(self, event):
         self.queue.append(event)
@@ -274,18 +315,37 @@ class AstraAgent:
         if not source_ip or not is_public_ip(source_ip):
             self.report_block(event, "skipped", "Refused to block non-public or invalid IP.", None)
             return
+        if source_ip in self.allowlist:
+            self.report_block(event, "skipped", "Refused to block allowlisted IP.", None)
+            return
+        existing = self.blocks.get(source_ip)
+        if existing and (not parse_time(existing.get("expiresAt")) or parse_time(existing.get("expiresAt")) > datetime.now(timezone.utc)):
+            self.report_block(event, "skipped", "IP is already blocked.", existing.get("expiresAt"))
+            return
         expires_at = datetime.now(timezone.utc) + timedelta(hours=int(decision.get("blockDurationHours") or 24))
-        command = ["ufw", "deny", "from", source_ip]
+        ports = decision.get("ports") or WEB_BLOCK_PORTS
+        results = []
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
-            if result.returncode == 0:
-                self.blocks[source_ip] = {"eventId": event["id"], "expiresAt": expires_at.isoformat()}
+            for port in ports:
+                command = ["ufw", "deny", "from", source_ip, "to", "any", "port", str(port)]
+                result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+                results.append(result)
+            failed = [result for result in results if result.returncode != 0]
+            if not failed:
+                self.blocks[source_ip] = {
+                    "eventId": event["id"],
+                    "expiresAt": expires_at.isoformat(),
+                    "ports": ports,
+                    "attackType": event.get("attackType"),
+                    "ruleId": event.get("ruleId"),
+                }
                 write_json(self.blocks_path, self.blocks)
-                self.report_block(event, "success", result.stdout.strip() or "Blocked with UFW.", expires_at.isoformat())
+                self.report_block(event, "success", "Blocked web access with UFW on ports 80/443.", expires_at.isoformat(), ports=ports)
             else:
-                self.report_block(event, "failed", result.stderr.strip() or "UFW command failed.", expires_at.isoformat())
+                message = "; ".join(result.stderr.strip() or result.stdout.strip() or "UFW command failed." for result in failed)
+                self.report_block(event, "failed", message, expires_at.isoformat(), ports=ports)
         except Exception as exc:
-            self.report_block(event, "failed", str(exc), expires_at.isoformat())
+            self.report_block(event, "failed", str(exc), expires_at.isoformat(), ports=ports)
 
     def expire_blocks(self):
         changed = False
@@ -294,27 +354,80 @@ class AstraAgent:
             expires_at = parse_time(info.get("expiresAt"))
             if not expires_at or expires_at > now:
                 continue
-            command = ["ufw", "delete", "deny", "from", source_ip]
-            event = {"id": info.get("eventId"), "sourceIp": source_ip}
-            try:
-                result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
-                status = "success" if result.returncode == 0 else "failed"
-                message = result.stdout.strip() or result.stderr.strip() or "Expired block removed."
-                self.report_block(event, status, message, None, action="unblock")
-                if status == "success":
-                    del self.blocks[source_ip]
-                    changed = True
-            except Exception as exc:
-                self.report_block(event, "failed", str(exc), None, action="unblock")
+            event = {
+                "id": info.get("eventId"),
+                "sourceIp": source_ip,
+                "attackType": info.get("attackType"),
+                "ruleId": info.get("ruleId"),
+            }
+            status, message = self.unblock_ip(source_ip, info.get("ports") or WEB_BLOCK_PORTS)
+            self.report_block(event, status, message, None, action="unblock", ports=info.get("ports") or WEB_BLOCK_PORTS)
+            if status == "success":
+                del self.blocks[source_ip]
+                changed = True
         if changed:
             write_json(self.blocks_path, self.blocks)
 
-    def report_block(self, event, status, message, expires_at, action="block"):
+    def unblock_ip(self, source_ip, ports=None):
+        ports = ports or WEB_BLOCK_PORTS
+        try:
+            results = []
+            for port in ports:
+                command = ["ufw", "delete", "deny", "from", source_ip, "to", "any", "port", str(port)]
+                results.append(subprocess.run(command, capture_output=True, text=True, timeout=30, check=False))
+            failed = [result for result in results if result.returncode != 0]
+            if failed:
+                message = "; ".join(result.stderr.strip() or result.stdout.strip() or "UFW unblock command failed." for result in failed)
+                return "failed", message
+            return "success", "Removed UFW web-port block."
+        except Exception as exc:
+            return "failed", str(exc)
+
+    def process_commands(self, commands):
+        changed = False
+        for command in commands:
+            if command.get("type") != "unblock":
+                self.report_command(command, "skipped", "Unsupported command type.")
+                continue
+            source_ip = command.get("sourceIp")
+            local_block = self.blocks.get(source_ip, {})
+            status, message = self.unblock_ip(source_ip, local_block.get("ports") or WEB_BLOCK_PORTS)
+            event = {
+                "id": local_block.get("eventId"),
+                "sourceIp": source_ip,
+                "attackType": local_block.get("attackType"),
+                "ruleId": local_block.get("ruleId"),
+            }
+            self.report_block(event, status, message, None, action="unblock", ports=local_block.get("ports") or WEB_BLOCK_PORTS)
+            self.report_command(command, status, message)
+            if status == "success" and source_ip in self.blocks:
+                del self.blocks[source_ip]
+                changed = True
+        if changed:
+            write_json(self.blocks_path, self.blocks)
+
+    def report_command(self, command, status, message):
+        payload = {
+            "siteId": self.site_id,
+            "agentToken": self.agent_token,
+            "commandId": command.get("id"),
+            "status": status,
+            "message": message,
+        }
+        try:
+            requests.post(f"{self.backend_url}/v1/agents/command-result", json=payload, timeout=15).raise_for_status()
+        except Exception as exc:
+            print(f"Could not report command result: {exc}")
+
+    def report_block(self, event, status, message, expires_at, action="block", ports=None):
         payload = {
             "siteId": self.site_id,
             "agentToken": self.agent_token,
             "eventId": event.get("id"),
             "sourceIp": event.get("sourceIp"),
+            "attackType": event.get("attackType"),
+            "ruleId": event.get("ruleId"),
+            "ports": ports or WEB_BLOCK_PORTS,
             "action": action,
             "status": status,
             "message": message,
@@ -326,7 +439,8 @@ class AstraAgent:
             print(f"Could not report block result: {exc}")
 
     def run_once(self):
-        self.heartbeat()
+        heartbeat = self.heartbeat()
+        self.process_commands(heartbeat.get("commands") or [])
         for record in self.tailer.poll():
             event = self.detector.inspect(record)
             if event:

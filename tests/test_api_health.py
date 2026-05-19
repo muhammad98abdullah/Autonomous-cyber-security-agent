@@ -73,6 +73,76 @@ class ApiHealthTests(unittest.TestCase):
         self.assertEqual(health["status"], "danger")
         self.assertEqual(health["lastDanger"]["attackType"], "web_scan")
 
+    def test_allowlist_prevents_block_decision(self):
+        created = self.client.post("/v1/sites", json={"name": "Demo", "domain": "example.com"}).json()
+        site_id = created["site"]["id"]
+        dashboard_token = created["dashboardToken"]
+        enrolled = self.client.post(
+            "/v1/agents/enroll",
+            json={"siteId": site_id, "enrollToken": created["enrollmentToken"], "hostname": "test-host"},
+        ).json()
+
+        self.client.post(
+            f"/v1/sites/{site_id}/allowlist",
+            headers={"Authorization": f"Bearer {dashboard_token}"},
+            json={"ip": "8.8.8.8", "label": "Test IP"},
+        )
+        heartbeat = self.client.post(
+            "/v1/agents/heartbeat",
+            json={"siteId": site_id, "agentToken": enrolled["agentToken"]},
+        ).json()
+        events = self.client.post(
+            "/v1/agents/events",
+            json={
+                "siteId": site_id,
+                "agentToken": enrolled["agentToken"],
+                "events": [{"attackType": "dos_http_flood", "severity": "critical", "sourceIp": "8.8.8.8"}],
+            },
+        ).json()
+
+        self.assertIn("8.8.8.8", heartbeat["allowlist"])
+        self.assertFalse(events["responses"][0]["block"])
+        self.assertEqual(events["responses"][0]["reason"], "allowlisted")
+
+    def test_blocklist_and_unblock_command_flow(self):
+        created = self.client.post("/v1/sites", json={"name": "Demo", "domain": "example.com"}).json()
+        site_id = created["site"]["id"]
+        dashboard_token = created["dashboardToken"]
+        enrolled = self.client.post(
+            "/v1/agents/enroll",
+            json={"siteId": site_id, "enrollToken": created["enrollmentToken"], "hostname": "test-host"},
+        ).json()
+
+        self.client.post(
+            "/v1/agents/block-result",
+            json={
+                "siteId": site_id,
+                "agentToken": enrolled["agentToken"],
+                "sourceIp": "8.8.8.8",
+                "attackType": "dos_http_flood",
+                "ruleId": "single_ip_flood",
+                "action": "block",
+                "status": "success",
+                "ports": [80, 443],
+            },
+        )
+        blocks = self.client.get(
+            f"/v1/sites/{site_id}/blocks",
+            headers={"Authorization": f"Bearer {dashboard_token}"},
+        ).json()
+        queued = self.client.post(
+            f"/v1/sites/{site_id}/blocks/8.8.8.8/unblock",
+            headers={"Authorization": f"Bearer {dashboard_token}"},
+        ).json()
+        heartbeat = self.client.post(
+            "/v1/agents/heartbeat",
+            json={"siteId": site_id, "agentToken": enrolled["agentToken"]},
+        ).json()
+
+        self.assertEqual(blocks["items"][0]["source_ip"], "8.8.8.8")
+        self.assertEqual(queued["status"], "queued")
+        self.assertEqual(heartbeat["commands"][0]["type"], "unblock")
+
 
 if __name__ == "__main__":
     unittest.main()
