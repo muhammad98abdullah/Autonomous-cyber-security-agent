@@ -35,6 +35,29 @@ class ApiHealthTests(unittest.TestCase):
         self.assertEqual(health.status_code, 200)
         self.assertEqual(health.json()["status"], "ok")
 
+    def test_site_create_uses_public_backend_url_for_installer(self):
+        created = self.client.post(
+            "/v1/sites",
+            json={
+                "name": "Demo",
+                "domain": "example.com",
+                "publicBackendUrl": "https://astra.example.com/api/",
+            },
+        ).json()
+
+        self.assertEqual(created["installBackendUrl"], "https://astra.example.com/api")
+        self.assertIn("https://astra.example.com/api/install.sh", created["installCommand"])
+        self.assertIn("--backend-url https://astra.example.com/api", created["installCommand"])
+        self.assertIsNone(created["installCommandWarning"])
+
+    def test_site_create_warns_when_installer_uses_localhost(self):
+        created = self.client.post(
+            "/v1/sites",
+            json={"name": "Demo", "domain": "example.com", "publicBackendUrl": "http://127.0.0.1:8000"},
+        ).json()
+
+        self.assertIn("localhost", created["installCommandWarning"])
+
     def test_health_danger_after_high_event(self):
         created = self.client.post("/v1/sites", json={"name": "Demo", "domain": "example.com"}).json()
         site_id = created["site"]["id"]

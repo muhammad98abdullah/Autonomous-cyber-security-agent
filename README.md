@@ -14,6 +14,14 @@ The backend stores MVP data in SQLite at `astra.db` by default. Override with:
 $env:ASTRA_DB_PATH="E:/FYP/astra-dev.db"
 ```
 
+If the agent will run on a different VPS, the installer must use a backend URL that the VPS can reach. Set it before creating sites:
+
+```powershell
+$env:ASTRA_PUBLIC_BACKEND_URL="https://YOUR-ASTRA-BACKEND"
+```
+
+You can also enter the same value in the frontend's `Public Backend URL` field when creating a site. Do not leave it as `127.0.0.1` unless the agent is installed on the same machine as the backend.
+
 ## Start Frontend
 
 The dashboard is isolated in `frontend/` and has no npm dependency.

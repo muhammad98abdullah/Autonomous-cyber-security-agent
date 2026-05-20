@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 import ipaddress
+import os
 import secrets
+import shlex
 from typing import Optional
 from uuid import uuid4
 
@@ -131,13 +133,30 @@ def _block_public(row):
     return item
 
 
-def _build_install_command(request: Request, site_id: str, enrollment_token: str):
-    backend_url = str(request.base_url).rstrip("/")
+def _command_quote(value: str):
+    return shlex.quote(str(value))
+
+
+def _public_backend_url(request: Request, data: Optional[dict] = None):
+    configured = os.getenv("ASTRA_PUBLIC_BACKEND_URL")
+    provided = (data or {}).get("publicBackendUrl")
+    backend_url = str(provided or configured or request.base_url).strip().rstrip("/")
+    if not backend_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="publicBackendUrl must start with http:// or https://")
+    return backend_url
+
+
+def _is_loopback_backend(backend_url: str):
+    return "://127.0.0.1" in backend_url or "://localhost" in backend_url
+
+
+def _build_install_command(request: Request, site_id: str, enrollment_token: str, backend_url: Optional[str] = None):
+    backend_url = (backend_url or _public_backend_url(request)).rstrip("/")
     return (
-        f"curl -fsSL {backend_url}/install.sh | sudo bash -s -- "
-        f"--backend-url {backend_url} "
-        f"--site-id {site_id} "
-        f"--enroll-token {enrollment_token}"
+        f"curl -fsSL {_command_quote(f'{backend_url}/install.sh')} | sudo bash -s -- "
+        f"--backend-url {_command_quote(backend_url)} "
+        f"--site-id {_command_quote(site_id)} "
+        f"--enroll-token {_command_quote(enrollment_token)}"
     )
 
 
@@ -222,6 +241,7 @@ def create_v1_site(data: dict, request: Request):
     enrollment_token = secrets.token_urlsafe(32)
     dashboard_token = secrets.token_urlsafe(32)
     now = _iso_now()
+    backend_url = _public_backend_url(request, data)
     with get_db() as db:
         db.execute(
             """
@@ -247,7 +267,13 @@ def create_v1_site(data: dict, request: Request):
         "site": _site_public(site),
         "enrollmentToken": enrollment_token,
         "dashboardToken": dashboard_token,
-        "installCommand": _build_install_command(request, site_id, enrollment_token),
+        "installCommand": _build_install_command(request, site_id, enrollment_token, backend_url),
+        "installBackendUrl": backend_url,
+        "installCommandWarning": (
+            "The install command points to localhost. Use a backend URL reachable from the client VPS."
+            if _is_loopback_backend(backend_url)
+            else None
+        ),
     }
 
 

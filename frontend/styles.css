@@ -553,6 +553,12 @@ button {
   line-height: 1.6;
 }
 
+.warning-text {
+  margin: 12px 0 0;
+  color: #92400e;
+  font-weight: 700;
+}
+
 .setup-list {
   display: grid;
   gap: 12px;

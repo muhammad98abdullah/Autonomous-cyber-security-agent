@@ -15,6 +15,7 @@ const state = {
   session: readJson(SESSION_KEY, null),
   sites: readJson(SITES_KEY, []),
   health: {},
+  healthErrors: {},
   events: {},
   blocks: {},
   allowlist: {},
@@ -129,16 +130,27 @@ async function refreshAll() {
 async function refreshSite(site) {
   if (!site.dashboardToken) return;
   const headers = { Authorization: `Bearer ${site.dashboardToken}` };
-  const [health, events, blocks, allowlist] = await Promise.all([
-    api(`/v1/sites/${site.id}/health`, { headers }),
-    api(`/v1/sites/${site.id}/events?limit=50`, { headers }),
-    api(`/v1/sites/${site.id}/blocks?limit=100`, { headers }),
-    api(`/v1/sites/${site.id}/allowlist`, { headers }),
-  ]);
-  state.health[site.id] = health;
-  state.events[site.id] = events.items || [];
-  state.blocks[site.id] = blocks.items || [];
-  state.allowlist[site.id] = allowlist.items || [];
+  try {
+    const [health, events, blocks, allowlist] = await Promise.all([
+      api(`/v1/sites/${site.id}/health`, { headers }),
+      api(`/v1/sites/${site.id}/events?limit=50`, { headers }),
+      api(`/v1/sites/${site.id}/blocks?limit=100`, { headers }),
+      api(`/v1/sites/${site.id}/allowlist`, { headers }),
+    ]);
+    delete state.healthErrors[site.id];
+    state.health[site.id] = health;
+    state.events[site.id] = events.items || [];
+    state.blocks[site.id] = blocks.items || [];
+    state.allowlist[site.id] = allowlist.items || [];
+  } catch (error) {
+    state.healthErrors[site.id] = error.message;
+    state.health[site.id] = {
+      status: "pending",
+      agentOnline: false,
+      message: error.message,
+      lastHeartbeatAt: site.lastHeartbeatAt,
+    };
+  }
 }
 
 async function createSite(event) {
@@ -153,6 +165,7 @@ async function createSite(event) {
         name: form.get("name"),
         domain: form.get("domain"),
         serverType: form.get("serverType"),
+        publicBackendUrl: form.get("publicBackendUrl"),
       }),
     });
     const site = {
@@ -160,6 +173,8 @@ async function createSite(event) {
       enrollmentToken: created.enrollmentToken,
       dashboardToken: created.dashboardToken,
       installCommand: created.installCommand,
+      installBackendUrl: created.installBackendUrl,
+      installCommandWarning: created.installCommandWarning,
     };
     state.sites = [site, ...state.sites.filter((item) => item.id !== site.id)];
     state.selectedSiteId = site.id;
@@ -480,6 +495,10 @@ function renderConnect() {
               <option value="apache">Apache</option>
             </select>
           </div>
+          <div class="field full">
+            <label>Public Backend URL</label>
+            <input name="publicBackendUrl" value="${escapeHtml(state.apiBase)}" placeholder="https://astra.example.com" required />
+          </div>
           <button class="primary-btn full" type="submit" ${state.loading ? "disabled" : ""}>
             ${icons.plug} ${state.loading ? "Creating..." : "Create Site"}
           </button>
@@ -519,6 +538,11 @@ function renderInstallBox(site) {
     <div class="command-box">
       <code>${escapeHtml(site.installCommand)}</code>
     </div>
+    ${
+      site.installCommandWarning
+        ? `<p class="subtle warning-text">${escapeHtml(site.installCommandWarning)}</p>`
+        : ""
+    }
   `;
 }
 
@@ -535,6 +559,7 @@ function renderSites() {
 
 function renderSiteCard(site) {
   const health = state.health[site.id] || {};
+  const healthError = state.healthErrors[site.id];
   const status = health.status || "pending";
   const pillClass = status === "danger" ? "danger" : status === "ok" ? "ok" : "pending";
   return `
@@ -548,6 +573,11 @@ function renderSiteCard(site) {
       </header>
       <div class="site-meta">
         <div class="meta-row"><span>Agent</span><strong>${health.agentOnline ? "Online" : "Offline/Pending"}</strong></div>
+        ${
+          healthError
+            ? `<div class="meta-row"><span>API</span><strong>${escapeHtml(healthError)}</strong></div>`
+            : ""
+        }
         <div class="meta-row"><span>Danger</span><strong>${health.dangerLevel || "none"}</strong></div>
         <div class="meta-row"><span>Blocks</span><strong>${health.activeBlocks || 0}</strong></div>
         <div class="meta-row"><span>Last heartbeat</span><strong>${formatTime(health.lastHeartbeatAt)}</strong></div>
@@ -904,6 +934,7 @@ function bindEvents() {
     state.session = null;
     state.sites = [];
     state.health = {};
+    state.healthErrors = {};
     state.events = {};
     state.blocks = {};
     state.allowlist = {};
